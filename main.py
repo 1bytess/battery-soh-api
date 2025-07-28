@@ -44,6 +44,7 @@ class BatteryData(BaseModel):
     model_type: str = Field(default="lstm", description="Model to use: 'lstm', 'bilstm', or 'tcn'")
     
     model_config = {
+        "protected_namespaces": (),
         "json_schema_extra": {
             "example": {
                 "voltage": [4.2, 4.1, 4.0, 3.9, 3.8, 3.7, 3.6, 3.5],
@@ -63,6 +64,10 @@ class PredictionResponse(BaseModel):
     processing_time: float = Field(..., description="Processing time in seconds")
     battery_info: Dict = Field(..., description="Information about the selected battery")
     timestamp: str
+    
+    model_config = {
+        "protected_namespaces": ()
+    }
 
 class HealthResponse(BaseModel):
     status: str
@@ -89,10 +94,9 @@ BATTERY_DATABASE = {
     'test_batteries': ['B0029', 'B0030', 'B0038', 'B0040', 'B0046', 'B0054']
 }
 
-# Battery specifications (nominal capacities for SOH calculation)
+# Battery specifications
 BATTERY_SPECS = {
-    # NASA battery dataset - nominal capacity around 2.0 Ah for most batteries
-    'nominal_capacity': 2.0  # Adjust based on your actual dataset
+    'nominal_capacity': 2.0
 }
 
 def load_models_and_scalers():
@@ -100,58 +104,101 @@ def load_models_and_scalers():
     global models, scalers
     
     try:
-        # Load models (adjust paths as needed)
-        model_paths = {
-            'bilstm': 'models/bilstm_model.keras',
-            'tcn': 'models/tcn_model.keras',
-            'lstm': 'models/simple_lstm_model.keras'
+        # Debug: List current working directory and available files
+        logger.info(f"Current working directory: {os.getcwd()}")
+        logger.info(f"Files in current directory: {os.listdir('.')}")
+        
+        # Check for models directory
+        models_dir = 'models'
+        if os.path.exists(models_dir):
+            logger.info(f"Models directory found: {models_dir}")
+            logger.info(f"Files in models directory: {os.listdir(models_dir)}")
+        else:
+            logger.warning(f"Models directory not found: {models_dir}")
+            models = {}
+            scalers = create_default_scalers()
+            return
+        
+        # Load models - try .keras first, then .h5 as fallback
+        model_files = {
+            'bilstm': ('bilstm_model.keras', 'bilstm_model_best.h5'),
+            'tcn': ('tcn_model.keras', 'tcn_model_best.h5'),
+            'lstm': ('lstm_model.keras', 'lstm_model_best.h5')
         }
         
-        for model_name, path in model_paths.items():
-            if os.path.exists(path):
+        for model_name, (keras_file, h5_file) in model_files.items():
+            model_loaded = False
+            
+            # Try .keras file first
+            keras_path = f'models/{keras_file}'
+            logger.info(f"Checking for {model_name} model at: {keras_path}")
+            if os.path.exists(keras_path):
                 try:
                     if model_name == 'tcn':
                         # TCN model needs custom objects
                         try:
                             from tcn import TCN
-                            models[model_name] = load_model(path, custom_objects={'TCN': TCN})
+                            models[model_name] = load_model(keras_path, custom_objects={'TCN': TCN})
                         except ImportError:
                             logger.warning(f"TCN library not available, skipping {model_name} model")
                             continue
                     else:
-                        models[model_name] = load_model(path)
-                    logger.info(f"Loaded {model_name} model successfully")
+                        models[model_name] = load_model(keras_path)
+                    logger.info(f"Loaded {model_name} model successfully from {keras_path}")
+                    model_loaded = True
                 except Exception as model_error:
-                    logger.error(f"Failed to load {model_name} model: {str(model_error)}")
-                    # Continue without this model
-                    continue
+                    logger.warning(f"Failed to load {model_name} from .keras: {str(model_error)}")
             else:
-                logger.warning(f"Model file not found: {path}")
-        
-        # Load scalers
-        scaler_path = 'models/scalers.pkl'
-        if os.path.exists(scaler_path):
-            try:
-                with open(scaler_path, 'rb') as f:
-                    loaded_data = pickle.load(f)
-                
-                # Check if this is the full prepared_data or just scalers
-                if 'scalers' in loaded_data:
-                    # This is the prepared_data dict, extract scalers
-                    scalers = loaded_data['scalers']
-                    logger.info("Loaded scalers from prepared_data structure")
+                logger.info(f"File not found: {keras_path}")
+            
+            # Try .h5 file as fallback
+            if not model_loaded:
+                h5_path = f'models/{h5_file}'
+                logger.info(f"Trying fallback {model_name} model at: {h5_path}")
+                if os.path.exists(h5_path):
+                    try:
+                        if model_name == 'tcn':
+                            try:
+                                from tcn import TCN
+                                models[model_name] = load_model(h5_path, custom_objects={'TCN': TCN})
+                            except ImportError:
+                                logger.warning(f"TCN library not available, skipping {model_name} model")
+                                continue
+                        else:
+                            models[model_name] = load_model(h5_path)
+                        logger.info(f"Loaded {model_name} model successfully from {h5_path}")
+                        model_loaded = True
+                    except Exception as model_error:
+                        logger.error(f"Failed to load {model_name} from .h5: {str(model_error)}")
                 else:
-                    # This is just the scalers dict
-                    scalers = loaded_data
-                    logger.info("Loaded scalers directly")
-                    
-                logger.info(f"Available scalers: {list(scalers.keys())}")
-                
-            except Exception as scaler_error:
-                logger.error(f"Failed to load scalers: {str(scaler_error)}")
-                scalers = create_default_scalers()
-        else:
-            logger.warning(f"Scalers file not found: {scaler_path}")
+                    logger.info(f"File not found: {h5_path}")
+            
+            if not model_loaded:
+                logger.warning(f"Could not load {model_name} model from either .keras or .h5 file")
+        
+        # Load scalers - try individual model scalers first
+        scalers_loaded = False
+        
+        # Try to load from any individual model scaler file (they should all be the same)
+        for model_name in ['lstm', 'bilstm', 'tcn']:
+            scaler_path = f'models/{model_name}_model_scalers.pkl'
+            logger.info(f"Checking for scalers at: {scaler_path}")
+            if os.path.exists(scaler_path):
+                try:
+                    with open(scaler_path, 'rb') as f:
+                        scalers = pickle.load(f)
+                    logger.info(f"Loaded scalers from {scaler_path}")
+                    logger.info(f"Available scalers: {list(scalers.keys())}")
+                    scalers_loaded = True
+                    break
+                except Exception as scaler_error:
+                    logger.warning(f"Failed to load scalers from {scaler_path}: {str(scaler_error)}")
+            else:
+                logger.info(f"Scaler file not found: {scaler_path}")
+        
+        # Create default scalers if none were loaded
+        if not scalers_loaded:
+            logger.warning("Could not load scalers from any source, creating defaults")
             scalers = create_default_scalers()
             
     except Exception as e:
@@ -170,15 +217,20 @@ def create_default_scalers():
     }
     
     # Fit with some dummy data so they work
-    dummy_data = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]])
+    dummy_data = np.array([[3.0], [3.5], [4.0], [4.2]])  # Realistic voltage range
     default_scalers['seq_voltage'].fit(dummy_data)
-    default_scalers['seq_current'].fit(dummy_data)
-    default_scalers['seq_temperature'].fit(dummy_data)
     
-    dummy_features = np.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]])
+    dummy_current = np.array([[0.0], [0.5], [1.0], [2.0]])  # Realistic current range
+    default_scalers['seq_current'].fit(dummy_current)
+    
+    dummy_temp = np.array([[0.0], [25.0], [35.0], [60.0]])  # Realistic temperature range
+    default_scalers['seq_temperature'].fit(dummy_temp)
+    
+    # 4 additional features: duration_hours, voltage_drop, temperature_mean, temperature_range
+    dummy_features = np.array([[1.0, 0.5, 25.0, 10.0], [2.0, 1.0, 30.0, 15.0], [3.0, 1.5, 35.0, 20.0]])
     default_scalers['additional_features'].fit(dummy_features)
     
-    dummy_capacity = np.array([[1.5], [2.0], [2.5], [3.0], [3.5]])
+    dummy_capacity = np.array([[1.0], [1.5], [2.0], [2.5]])  # Realistic capacity range
     default_scalers['capacity'].fit(dummy_capacity)
     
     logger.info("Created and fitted default scalers")
@@ -189,7 +241,6 @@ def normalize_sequences(voltage, current, temperature):
     try:
         # Check if scalers are properly fitted
         if not hasattr(scalers.get('seq_voltage'), 'scale_'):
-            # If scalers aren't fitted, fit them with reasonable dummy data
             logger.warning("Scalers not fitted, using default normalization")
             
             # Simple min-max normalization with typical battery ranges
@@ -221,15 +272,13 @@ def normalize_sequences(voltage, current, temperature):
         
         return voltage_normalized, current_normalized, temperature_normalized
 
-
-
 def prepare_model_inputs(voltage, current, temperature, battery_id):
-    """Prepare inputs for different models with simplified feature extraction"""
+    """Prepare inputs for different models - matches your actual model architecture"""
     # Normalize sequences
     voltage_norm, current_norm, temp_norm = normalize_sequences(voltage, current, temperature)
     
     # Ensure all sequences have the same length (pad or truncate if needed)
-    target_length = 100  # Adjust based on your training data
+    target_length = 100  # Based on your actual training data
     
     def pad_or_truncate(seq, target_len):
         if len(seq) > target_len:
@@ -242,25 +291,23 @@ def prepare_model_inputs(voltage, current, temperature, battery_id):
     current_norm = pad_or_truncate(current_norm, target_length)
     temp_norm = pad_or_truncate(temp_norm, target_length)
     
-    # Prepare sequence input for BiLSTM and TCN
+    # Prepare sequence input (shape: [1, 100, 3])
     sequence_input = np.array([voltage_norm, current_norm, temp_norm]).T
     sequence_input = sequence_input.reshape(1, target_length, 3)
     
-    # Simplified additional features (6 features to match training)
+    # Calculate the 4 additional features that match your training data
     voltage_seq = np.array(voltage)
     current_seq = np.array(current)
     temp_seq = np.array(temperature)
     
-    # Calculate the 6 features that match your training data
-    ambient_temp = temp_seq[0]  # Starting temperature
-    duration_hours = len(voltage_seq) * 0.1  # Estimated duration
-    energy_wh = np.trapz(voltage_seq * current_seq) * 0.1  # Energy calculation
+    # Features: duration_hours, voltage_drop, temperature_mean, temperature_range
+    duration_hours = len(voltage_seq) * 0.1  # Estimated duration based on sequence length
     voltage_drop = voltage_seq[0] - voltage_seq[-1] if len(voltage_seq) > 1 else 0.0
-    temp_mean = np.mean(temp_seq)
-    temp_range = np.max(temp_seq) - np.min(temp_seq) if len(temp_seq) > 1 else 0.0
+    temperature_mean = np.mean(temp_seq)
+    temperature_range = np.max(temp_seq) - np.min(temp_seq) if len(temp_seq) > 1 else 0.0
     
     additional_features = np.array([
-        ambient_temp, duration_hours, energy_wh, voltage_drop, temp_mean, temp_range
+        duration_hours, voltage_drop, temperature_mean, temperature_range
     ]).reshape(1, -1)
     
     # Normalize additional features
@@ -269,16 +316,13 @@ def prepare_model_inputs(voltage, current, temperature, battery_id):
             additional_features = scalers['additional_features'].transform(additional_features)
         except Exception as e:
             logger.warning(f"Using fallback normalization for additional features: {str(e)}")
-            # Fallback normalization
-            additional_features = additional_features / np.array([30.0, 5.0, 1000.0, 1.0, 30.0, 20.0]).reshape(1, -1)
+            # Fallback normalization based on typical ranges
+            additional_features = additional_features / np.array([5.0, 1.0, 30.0, 20.0]).reshape(1, -1)
     else:
         # Simple normalization
-        additional_features = additional_features / np.array([30.0, 5.0, 1000.0, 1.0, 30.0, 20.0]).reshape(1, -1)
+        additional_features = additional_features / np.array([5.0, 1.0, 30.0, 20.0]).reshape(1, -1)
     
-    # For simple LSTM (only sequence input)
-    lstm_input = sequence_input
-    
-    return sequence_input, additional_features, lstm_input
+    return sequence_input, additional_features
 
 def calculate_soh(predicted_capacity, battery_id):
     """Calculate State of Health percentage"""
@@ -375,19 +419,15 @@ async def predict_soh(data: BatteryData):
                 detail=f"Model '{data.model_type}' is not available. Available models: {list(models.keys())}"
             )
         
-        # Prepare inputs
-        sequence_input, additional_features, lstm_input = prepare_model_inputs(
+        # Prepare inputs - all models use both sequence and additional features
+        sequence_input, additional_features = prepare_model_inputs(
             data.voltage, data.current, data.temperature, data.battery_id
         )
         
         # Make prediction with selected model
         try:
-            if data.model_type == 'bilstm':
-                pred_norm = models['bilstm'].predict([sequence_input, additional_features], verbose=0)
-            elif data.model_type == 'tcn':
-                pred_norm = models['tcn'].predict([sequence_input, additional_features], verbose=0)
-            elif data.model_type == 'lstm':
-                pred_norm = models['lstm'].predict(lstm_input, verbose=0)
+            # All models (LSTM, BiLSTM, TCN) have the same input format: [sequence_input, additional_features]
+            pred_norm = models[data.model_type].predict([sequence_input, additional_features], verbose=0)
             
             # Denormalize prediction
             predicted_capacity = scalers['capacity'].inverse_transform(pred_norm.reshape(-1, 1))[0, 0]
