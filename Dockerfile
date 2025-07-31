@@ -35,7 +35,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir tensorflow==2.14.0 numpy==1.24.3 pandas==2.0.3 scikit-learn==1.3.0 && \
     pip install --no-cache-dir fastapi==0.100.1 uvicorn[standard]==0.23.2 pydantic==2.4.2 python-multipart==0.0.6 && \
-    pip install --no-cache-dir keras-tcn==3.5.0 python-json-logger==2.0.7 requests==2.31.0
+    pip install --no-cache-dir keras-tcn==3.5.0 python-json-logger==2.0.7 requests==2.31.0 && \
+    pip install --no-cache-dir psutil==5.9.6 GPUtil==1.4.0
 
 # Copy application code
 COPY . .

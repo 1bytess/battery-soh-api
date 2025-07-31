@@ -11,6 +11,8 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import uvicorn
 import os
 import logging
+import psutil
+import GPUtil
 from datetime import datetime
 
 # Configure logging
@@ -83,6 +85,7 @@ class HealthResponse(BaseModel):
     available_batteries: Dict[str, List[str]]
     gpu_available: bool
     impedance_support: bool
+    system_info: Optional[Dict] = None  # NEW: System information
     timestamp: str
 
 class BatteryListResponse(BaseModel):
@@ -214,7 +217,77 @@ def load_models_and_scalers():
         models = {}
         scalers = create_default_scalers()
 
-def create_default_scalers():
+def get_system_info():
+    """Get comprehensive system information including GPU/CPU usage"""
+    try:
+        system_info = {
+            "process_type": "gpu" if len(tf.config.list_physical_devices('GPU')) > 0 else "cpu"
+        }
+        
+        # CPU Information
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            system_info.update({
+                "cpu_usage": cpu_percent,
+                "cpu_cores": psutil.cpu_count(),
+                "memory_total_gb": round(memory.total / (1024**3), 2),
+                "memory_used_gb": round(memory.used / (1024**3), 2),
+                "memory_percent": memory.percent
+            })
+        except Exception as e:
+            logger.warning(f"Failed to get CPU info: {e}")
+        
+        # GPU Information
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]  # Use first GPU
+                system_info.update({
+                    "gpu_name": gpu.name,
+                    "gpu_memory_total": int(gpu.memoryTotal),
+                    "gpu_memory_used": int(gpu.memoryUsed),
+                    "gpu_memory_free": int(gpu.memoryFree),
+                    "gpu_load": round(gpu.load * 100, 1),
+                    "gpu_temperature": gpu.temperature
+                })
+            elif len(tf.config.list_physical_devices('GPU')) > 0:
+                # TensorFlow detected GPU but GPUtil failed
+                try:
+                    # Try to get TensorFlow GPU memory info
+                    physical_devices = tf.config.list_physical_devices('GPU')
+                    if physical_devices:
+                        # Get basic GPU info from TensorFlow
+                        system_info.update({
+                            "gpu_name": "GPU Detected (TensorFlow)",
+                            "gpu_memory_total": "Unknown",
+                            "gpu_memory_used": "Unknown", 
+                            "gpu_load": "Unknown",
+                            "gpu_details": f"{len(physical_devices)} GPU(s) available"
+                        })
+                except Exception as tf_error:
+                    logger.warning(f"Failed to get TensorFlow GPU info: {tf_error}")
+        except Exception as e:
+            logger.warning(f"Failed to get GPU info: {e}")
+            
+        # Process Information
+        try:
+            current_process = psutil.Process()
+            system_info.update({
+                "process_memory_mb": round(current_process.memory_info().rss / (1024**2), 2),
+                "process_cpu_percent": current_process.cpu_percent()
+            })
+        except Exception as e:
+            logger.warning(f"Failed to get process info: {e}")
+            
+        return system_info
+        
+    except Exception as e:
+        logger.error(f"Failed to get system info: {e}")
+        return {
+            "process_type": "cpu",
+            "error": "System info unavailable"
+        }
     """Create default scalers for when loading fails"""
     default_scalers = {
         'seq_voltage': MinMaxScaler(),
@@ -248,6 +321,78 @@ def create_default_scalers():
     
     logger.info("Created and fitted default scalers for 7 additional features")
     return default_scalers
+
+def get_system_info():
+    """Get comprehensive system information including GPU/CPU usage"""
+    try:
+        system_info = {
+            "process_type": "gpu" if len(tf.config.list_physical_devices('GPU')) > 0 else "cpu"
+        }
+        
+        # CPU Information
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            system_info.update({
+                "cpu_usage": cpu_percent,
+                "cpu_cores": psutil.cpu_count(),
+                "memory_total_gb": round(memory.total / (1024**3), 2),
+                "memory_used_gb": round(memory.used / (1024**3), 2),
+                "memory_percent": memory.percent
+            })
+        except Exception as e:
+            logger.warning(f"Failed to get CPU info: {e}")
+        
+        # GPU Information
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]  # Use first GPU
+                system_info.update({
+                    "gpu_name": gpu.name,
+                    "gpu_memory_total": int(gpu.memoryTotal),
+                    "gpu_memory_used": int(gpu.memoryUsed),
+                    "gpu_memory_free": int(gpu.memoryFree),
+                    "gpu_load": round(gpu.load * 100, 1),
+                    "gpu_temperature": gpu.temperature
+                })
+            elif len(tf.config.list_physical_devices('GPU')) > 0:
+                # TensorFlow detected GPU but GPUtil failed
+                try:
+                    # Try to get TensorFlow GPU memory info
+                    physical_devices = tf.config.list_physical_devices('GPU')
+                    if physical_devices:
+                        # Get basic GPU info from TensorFlow
+                        system_info.update({
+                            "gpu_name": "GPU Detected (TensorFlow)",
+                            "gpu_memory_total": "Unknown",
+                            "gpu_memory_used": "Unknown", 
+                            "gpu_load": "Unknown",
+                            "gpu_details": f"{len(physical_devices)} GPU(s) available"
+                        })
+                except Exception as tf_error:
+                    logger.warning(f"Failed to get TensorFlow GPU info: {tf_error}")
+        except Exception as e:
+            logger.warning(f"Failed to get GPU info: {e}")
+            
+        # Process Information
+        try:
+            current_process = psutil.Process()
+            system_info.update({
+                "process_memory_mb": round(current_process.memory_info().rss / (1024**2), 2),
+                "process_cpu_percent": current_process.cpu_percent()
+            })
+        except Exception as e:
+            logger.warning(f"Failed to get process info: {e}")
+            
+        return system_info
+        
+    except Exception as e:
+        logger.error(f"Failed to get system info: {e}")
+        return {
+            "process_type": "cpu",
+            "error": "System info unavailable"
+        }
 
 def normalize_sequences(voltage, current, temperature):
     """Normalize input sequences using loaded scalers"""
@@ -452,9 +597,12 @@ def get_battery_info(battery_id):
 
 @app.get("/v3/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
+    """Enhanced health check endpoint with system monitoring"""
     gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
     available_models = [name for name in ['lstm', 'bilstm', 'tcn'] if name in models]
+    
+    # Get comprehensive system information
+    system_info = get_system_info()
     
     return HealthResponse(
         status="healthy",
@@ -466,6 +614,7 @@ async def health_check():
         },
         gpu_available=gpu_available,
         impedance_support=True,
+        system_info=system_info,
         timestamp=datetime.now().isoformat()
     )
 
@@ -581,14 +730,35 @@ async def startup_event():
     logger.info("Starting up Battery Capacity Prediction API v3.1 with impedance support")
     load_models_and_scalers()
     
+    # Log system information
+    system_info = get_system_info()
+    logger.info(f"System Info: {system_info}")
+    
     # Log GPU availability
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         logger.info(f"GPU devices available: {len(gpus)}")
         for gpu in gpus:
             logger.info(f"GPU: {gpu}")
+        
+        # Try to get GPU memory info
+        try:
+            import GPUtil
+            gpu_list = GPUtil.getGPUs()
+            if gpu_list:
+                for i, gpu in enumerate(gpu_list):
+                    logger.info(f"GPU {i}: {gpu.name} | Memory: {gpu.memoryUsed}/{gpu.memoryTotal} MB | Load: {gpu.load*100:.1f}%")
+        except Exception as e:
+            logger.warning(f"Could not get detailed GPU info: {e}")
     else:
         logger.info("No GPU devices found, using CPU")
+    
+    # Log CPU information
+    try:
+        import psutil
+        logger.info(f"CPU: {psutil.cpu_count()} cores | Memory: {psutil.virtual_memory().total / (1024**3):.1f} GB")
+    except Exception as e:
+        logger.warning(f"Could not get CPU info: {e}")
 
 @app.get("/v3/")
 async def root():
@@ -606,7 +776,8 @@ async def root():
         "features": {
             "impedance_support": True,
             "optional_re_rct_inputs": True,
-            "automatic_estimation": True
+            "automatic_estimation": True,
+            "system_monitoring": True
         },
         "total_batteries": len(BATTERY_DATABASE['train_batteries']) + len(BATTERY_DATABASE['test_batteries'])
     }

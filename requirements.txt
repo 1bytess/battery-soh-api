@@ -10,3 +10,7 @@ python-multipart==0.0.6
 python-json-logger==2.0.7
 requests==2.31.0
 typing-extensions==4.5.0
+
+# System monitoring dependencies
+psutil==5.9.6
+GPUtil==1.4.0
