@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 # FastAPI app with custom docs URL
 app = FastAPI(
     title="Battery Capacity Prediction API",
-    description="AI-powered battery capacity prediction using BiLSTM, TCN, and LSTM models",
-    version="3.0.0",
+    description="AI-powered battery capacity prediction using BiLSTM, TCN, and LSTM models with impedance support",
+    version="3.1.0",
     docs_url="/v3/docs",
     redoc_url="/v3/redoc"
 )
@@ -43,6 +43,10 @@ class BatteryData(BaseModel):
     battery_id: str = Field(..., description="Battery identifier from dataset")
     model_type: str = Field(default="lstm", description="Model to use: 'lstm', 'bilstm', or 'tcn'")
     
+    # NEW: Optional impedance parameters
+    re: Optional[float] = Field(None, description="Electrolyte resistance (Ω) - optional", ge=0.0, le=1.0)
+    rct: Optional[float] = Field(None, description="Charge transfer resistance (Ω) - optional", ge=0.0, le=5.0)
+    
     model_config = {
         "protected_namespaces": (),
         "json_schema_extra": {
@@ -51,7 +55,9 @@ class BatteryData(BaseModel):
                 "current": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
                 "temperature": [25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0],
                 "battery_id": "B0005",
-                "model_type": "lstm"
+                "model_type": "lstm",
+                "re": 0.056,  # Optional
+                "rct": 0.201  # Optional
             }
         }
     }
@@ -63,6 +69,7 @@ class PredictionResponse(BaseModel):
     confidence_score: Optional[float] = Field(None, description="Prediction confidence (0-1)")
     processing_time: float = Field(..., description="Processing time in seconds")
     battery_info: Dict = Field(..., description="Information about the selected battery")
+    impedance_info: Dict = Field(..., description="Information about impedance values used")
     timestamp: str
     
     model_config = {
@@ -75,6 +82,7 @@ class HealthResponse(BaseModel):
     available_models: List[str]
     available_batteries: Dict[str, List[str]]
     gpu_available: bool
+    impedance_support: bool
     timestamp: str
 
 class BatteryListResponse(BaseModel):
@@ -86,7 +94,7 @@ class BatteryListResponse(BaseModel):
 models = {}
 scalers = {}
 
-# Battery database from your training
+# Battery database from your training (NASA dataset)
 BATTERY_DATABASE = {
     'train_batteries': ['B0005', 'B0006', 'B0007', 'B0018', 'B0025', 'B0026', 'B0027', 'B0028', 
                        'B0031', 'B0032', 'B0033', 'B0034', 'B0036', 'B0039', 'B0041', 'B0042', 
@@ -94,7 +102,7 @@ BATTERY_DATABASE = {
     'test_batteries': ['B0029', 'B0030', 'B0038', 'B0040', 'B0046', 'B0054']
 }
 
-# Battery specifications
+# Battery specifications (NASA dataset nominal capacity)
 BATTERY_SPECS = {
     'nominal_capacity': 2.0
 }
@@ -226,14 +234,19 @@ def create_default_scalers():
     dummy_temp = np.array([[0.0], [25.0], [35.0], [60.0]])  # Realistic temperature range
     default_scalers['seq_temperature'].fit(dummy_temp)
     
-    # 4 additional features: duration_hours, voltage_drop, temperature_mean, temperature_range
-    dummy_features = np.array([[1.0, 0.5, 25.0, 10.0], [2.0, 1.0, 30.0, 15.0], [3.0, 1.5, 35.0, 20.0]])
+    # 7 additional features: duration_hours, voltage_drop, temperature_mean, temperature_range, Re_mapped, Rct_mapped, impedance_time_diff
+    dummy_features = np.array([
+        [1.0, 0.5, 25.0, 10.0, 0.03, 0.2, 24.0],  # Sample 1
+        [2.0, 1.0, 30.0, 15.0, 0.05, 0.3, 48.0],  # Sample 2
+        [3.0, 1.5, 35.0, 20.0, 0.08, 0.5, 72.0],  # Sample 3
+        [4.0, 2.0, 40.0, 25.0, 0.12, 0.8, 96.0]   # Sample 4
+    ])
     default_scalers['additional_features'].fit(dummy_features)
     
     dummy_capacity = np.array([[1.0], [1.5], [2.0], [2.5]])  # Realistic capacity range
     default_scalers['capacity'].fit(dummy_capacity)
     
-    logger.info("Created and fitted default scalers")
+    logger.info("Created and fitted default scalers for 7 additional features")
     return default_scalers
 
 def normalize_sequences(voltage, current, temperature):
@@ -272,8 +285,64 @@ def normalize_sequences(voltage, current, temperature):
         
         return voltage_normalized, current_normalized, temperature_normalized
 
-def prepare_model_inputs(voltage, current, temperature, battery_id):
-    """Prepare inputs for different models - matches your actual model architecture"""
+def estimate_electrolyte_resistance(voltage_seq, temp_seq, battery_id):
+    """Estimate Re based on voltage and temperature characteristics (NASA dataset ranges)"""
+    # Based on NASA dataset: Re typical range 0.01-0.15 Ω
+    temp_mean = np.mean(temp_seq)
+    voltage_std = np.std(voltage_seq)
+    
+    # Base resistance (typical range from NASA data)
+    base_re = 0.056  # Average from dataset
+    
+    # Temperature effect (resistance increases at lower temps)
+    temp_factor = 1.0 + (25.0 - temp_mean) * 0.002
+    
+    # Voltage variation effect (more variation might indicate aging)
+    voltage_factor = 1.0 + voltage_std * 0.1
+    
+    # Battery aging effect based on battery ID
+    battery_factor = 1.0 + (ord(battery_id[-1]) % 5) * 0.01
+    
+    re_estimated = base_re * temp_factor * voltage_factor * battery_factor
+    return max(0.01, min(0.15, re_estimated))  # Clamp to NASA dataset range
+
+def estimate_charge_transfer_resistance(voltage_seq, current_seq, battery_id):
+    """Estimate Rct based on voltage and current characteristics (NASA dataset ranges)"""
+    # Based on NASA dataset: Rct typical range 0.05-1.0 Ω
+    voltage_range = np.max(voltage_seq) - np.min(voltage_seq)
+    current_mean = np.mean(current_seq)
+    
+    # Base resistance (typical range from NASA data)
+    base_rct = 0.201  # Average from dataset
+    
+    # Voltage drop effect (larger drops might indicate higher resistance)
+    voltage_effect = 1.0 + (1.0 - voltage_range) * 0.3
+    
+    # Current effect (higher currents might reveal resistance issues)
+    current_effect = 1.0 + current_mean * 0.05
+    
+    # Battery aging simulation
+    battery_factor = 1.0 + (ord(battery_id[-1]) % 7) * 0.03
+    
+    rct_estimated = base_rct * voltage_effect * current_effect * battery_factor
+    return max(0.05, min(1.0, rct_estimated))  # Clamp to NASA dataset range
+
+def estimate_impedance_time_diff(duration_hours, battery_id):
+    """Estimate impedance_time_diff based on test duration and battery characteristics"""
+    # Simulate time since last impedance measurement (in hours)
+    base_time = 24.0  # 24 hours as baseline
+    
+    # Duration effect (longer tests might indicate more time since last measurement)
+    duration_effect = duration_hours * 2.0
+    
+    # Battery-specific variation
+    battery_variation = (ord(battery_id[-1]) % 10) * 5.0
+    
+    time_diff = base_time + duration_effect + battery_variation
+    return max(1.0, min(200.0, time_diff))  # Clamp to reasonable range (1-200 hours)
+
+def prepare_model_inputs(voltage, current, temperature, battery_id, re_input=None, rct_input=None):
+    """Prepare inputs for different models - with optional Re/Rct inputs"""
     # Normalize sequences
     voltage_norm, current_norm, temp_norm = normalize_sequences(voltage, current, temperature)
     
@@ -295,34 +364,64 @@ def prepare_model_inputs(voltage, current, temperature, battery_id):
     sequence_input = np.array([voltage_norm, current_norm, temp_norm]).T
     sequence_input = sequence_input.reshape(1, target_length, 3)
     
-    # Calculate the 4 additional features that match your training data
+    # Calculate the 7 additional features
     voltage_seq = np.array(voltage)
     current_seq = np.array(current)
     temp_seq = np.array(temperature)
     
-    # Features: duration_hours, voltage_drop, temperature_mean, temperature_range
+    # Original 4 features
     duration_hours = len(voltage_seq) * 0.1  # Estimated duration based on sequence length
     voltage_drop = voltage_seq[0] - voltage_seq[-1] if len(voltage_seq) > 1 else 0.0
     temperature_mean = np.mean(temp_seq)
     temperature_range = np.max(temp_seq) - np.min(temp_seq) if len(temp_seq) > 1 else 0.0
     
+    # Use provided Re/Rct or estimate them
+    if re_input is not None:
+        re_mapped = re_input
+        re_source = "user_provided"
+    else:
+        re_mapped = estimate_electrolyte_resistance(voltage_seq, temp_seq, battery_id)
+        re_source = "estimated"
+    
+    if rct_input is not None:
+        rct_mapped = rct_input
+        rct_source = "user_provided"
+    else:
+        rct_mapped = estimate_charge_transfer_resistance(voltage_seq, current_seq, battery_id)
+        rct_source = "estimated"
+    
+    # impedance_time_diff (always estimated)
+    impedance_time_diff = estimate_impedance_time_diff(duration_hours, battery_id)
+    
     additional_features = np.array([
-        duration_hours, voltage_drop, temperature_mean, temperature_range
+        duration_hours, voltage_drop, temperature_mean, temperature_range,
+        re_mapped, rct_mapped, impedance_time_diff
     ]).reshape(1, -1)
     
-    # Normalize additional features
+    # Normalize additional features (7 features now)
     if 'additional_features' in scalers and hasattr(scalers['additional_features'], 'scale_'):
         try:
             additional_features = scalers['additional_features'].transform(additional_features)
         except Exception as e:
             logger.warning(f"Using fallback normalization for additional features: {str(e)}")
-            # Fallback normalization based on typical ranges
-            additional_features = additional_features / np.array([5.0, 1.0, 30.0, 20.0]).reshape(1, -1)
+            # Fallback normalization based on typical ranges for all 7 features
+            feature_ranges = np.array([5.0, 1.0, 30.0, 20.0, 0.1, 0.5, 100.0]).reshape(1, -1)
+            additional_features = additional_features / feature_ranges
     else:
-        # Simple normalization
-        additional_features = additional_features / np.array([5.0, 1.0, 30.0, 20.0]).reshape(1, -1)
+        # Simple normalization for 7 features
+        feature_ranges = np.array([5.0, 1.0, 30.0, 20.0, 0.1, 0.5, 100.0]).reshape(1, -1)
+        additional_features = additional_features / feature_ranges
     
-    return sequence_input, additional_features
+    # Return impedance info for response
+    impedance_info = {
+        "re_value": float(re_mapped),
+        "re_source": re_source,
+        "rct_value": float(rct_mapped),
+        "rct_source": rct_source,
+        "impedance_time_diff_hours": float(impedance_time_diff)
+    }
+    
+    return sequence_input, additional_features, impedance_info
 
 def calculate_soh(predicted_capacity, battery_id):
     """Calculate State of Health percentage"""
@@ -366,6 +465,7 @@ async def health_check():
             "test_batteries": BATTERY_DATABASE['test_batteries']
         },
         gpu_available=gpu_available,
+        impedance_support=True,
         timestamp=datetime.now().isoformat()
     )
 
@@ -380,7 +480,7 @@ async def get_batteries():
 
 @app.post("/v3/predict", response_model=PredictionResponse)
 async def predict_soh(data: BatteryData):
-    """Predict battery State of Health using selected model"""
+    """Predict battery State of Health using selected model with optional impedance inputs"""
     start_time = datetime.now()
     
     try:
@@ -420,8 +520,10 @@ async def predict_soh(data: BatteryData):
             )
         
         # Prepare inputs - all models use both sequence and additional features
-        sequence_input, additional_features = prepare_model_inputs(
-            data.voltage, data.current, data.temperature, data.battery_id
+        # NEW: Pass optional Re/Rct inputs
+        sequence_input, additional_features, impedance_info = prepare_model_inputs(
+            data.voltage, data.current, data.temperature, data.battery_id,
+            re_input=data.re, rct_input=data.rct
         )
         
         # Make prediction with selected model
@@ -435,10 +537,19 @@ async def predict_soh(data: BatteryData):
             # Calculate SOH percentage
             soh_percentage = calculate_soh(predicted_capacity, data.battery_id)
             
-            # Calculate confidence (simple heuristic based on input quality)
+            # Calculate confidence (improved heuristic considering impedance inputs)
             voltage_std = np.std(data.voltage)
             temp_range = max(data.temperature) - min(data.temperature)
-            confidence = min(0.95, max(0.5, 1.0 - (voltage_std * 0.1) - (temp_range * 0.01)))
+            base_confidence = min(0.95, max(0.5, 1.0 - (voltage_std * 0.1) - (temp_range * 0.01)))
+            
+            # Boost confidence if user provided actual impedance measurements
+            impedance_bonus = 0.0
+            if data.re is not None:
+                impedance_bonus += 0.05
+            if data.rct is not None:
+                impedance_bonus += 0.05
+            
+            confidence = min(0.98, base_confidence + impedance_bonus)
             
         except Exception as model_error:
             logger.error(f"{data.model_type} prediction error: {str(model_error)}")
@@ -454,6 +565,7 @@ async def predict_soh(data: BatteryData):
             confidence_score=float(confidence),
             processing_time=processing_time,
             battery_info=battery_info,
+            impedance_info=impedance_info,
             timestamp=datetime.now().isoformat()
         )
         
@@ -466,7 +578,7 @@ async def predict_soh(data: BatteryData):
 @app.on_event("startup")
 async def startup_event():
     """Load models and scalers on startup"""
-    logger.info("Starting up Battery Capacity Prediction API v3.0")
+    logger.info("Starting up Battery Capacity Prediction API v3.1 with impedance support")
     load_models_and_scalers()
     
     # Log GPU availability
@@ -482,8 +594,8 @@ async def startup_event():
 async def root():
     """Root endpoint"""
     return {
-        "message": "Battery State of Health (SOH) Prediction API v3.0",
-        "description": "AI-powered battery health estimation using LSTM, BiLSTM, and TCN models",
+        "message": "Battery State of Health (SOH) Prediction API v3.1",
+        "description": "AI-powered battery health estimation using LSTM, BiLSTM, and TCN models with impedance support",
         "endpoints": {
             "health": "/v3/health",
             "batteries": "/v3/batteries", 
@@ -491,6 +603,11 @@ async def root():
             "documentation": "/v3/docs"
         },
         "models": ["lstm", "bilstm", "tcn"],
+        "features": {
+            "impedance_support": True,
+            "optional_re_rct_inputs": True,
+            "automatic_estimation": True
+        },
         "total_batteries": len(BATTERY_DATABASE['train_batteries']) + len(BATTERY_DATABASE['test_batteries'])
     }
 
